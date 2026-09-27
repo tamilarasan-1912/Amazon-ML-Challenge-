@@ -1,470 +1,234 @@
-"""Feature engineering for Business Entity Resolution"""
-import polars as pl
+"""Pairwise feature computation for Business Entity Resolution."""
+
+import re
+from typing import Dict, List, Tuple, Set
 import numpy as np
-from rapidfuzz import fuzz, process
-from typing import List, Dict, Tuple, Optional
-from collections import Counter
-import logging
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-logger = logging.getLogger(__name__)
+from .normalize import NormalizedRecord, normalize_name, normalize_address
 
 
-def jaro_winkler(s1: str, s2: str) -> float:
-    """Jaro-Winkler similarity"""
-    if not s1 or not s2:
+def jaro_winkler_sim(a: str, b: str) -> float:
+    return fuzz.ratio(a, b) / 100.0 * 0.0 + fuzz.WRatio(a, b) / 100.0
+
+
+def levenshtein_ratio(a: str, b: str) -> float:
+    if not a or not b:
         return 0.0
-    return fuzz.jaro_winkler(s1, s2)
+    return 1.0 - (Levenshtein.distance(a, b) / max(len(a), len(b)))
 
 
-def levenshtein_ratio(s1: str, s2: str) -> float:
-    """Normalized Levenshtein similarity"""
-    if not s1 or not s2:
-        return 0.0
-    return fuzz.ratio(s1, s2) / 100.0
-
-
-def token_jaccard(s1: str, s2: str) -> float:
-    """Token Jaccard similarity"""
-    if not s1 or not s2:
-        return 0.0
-    tokens1 = set(s1.split())
-    tokens2 = set(s2.split())
-    if not tokens1 and not tokens2:
+def token_set_jaccard(a_tokens: List[str], b_tokens: List[str]) -> float:
+    set_a, set_b = set(a_tokens), set(b_tokens)
+    if not set_a and not set_b:
         return 1.0
-    if not tokens1 or not tokens2:
+    if not set_a or not set_b:
         return 0.0
-    return len(tokens1 & tokens2) / len(tokens1 | tokens2)
+    return len(set_a & set_b) / len(set_a | set_b)
 
 
-def token_overlap(s1: str, s2: str) -> int:
-    """Count of overlapping tokens"""
-    if not s1 or not s2:
+def token_sort_ratio(a: str, b: str) -> float:
+    a_sorted = " ".join(sorted(a.split()))
+    b_sorted = " ".join(sorted(b.split()))
+    return fuzz.ratio(a_sorted, b_sorted) / 100.0
+
+
+def tfidf_char_ngram_cosine(texts: List[str]) -> np.ndarray:
+    """Compute TF-IDF char n-gram cosine similarity matrix."""
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=1)
+    tfidf = vectorizer.fit_transform(texts)
+    sim = (tfidf * tfidf.T).toarray()
+    return sim
+
+
+def exact_match_flag(a: str, b: str) -> int:
+    return int(a.strip().lower() == b.strip().lower())
+
+
+def contains_substring(a: str, b: str) -> int:
+    a_low, b_low = a.lower(), b.lower()
+    return int(a_low in b_low or b_low in a_low)
+
+
+def first_token_match(a_tokens: List[str], b_tokens: List[str]) -> int:
+    if not a_tokens or not b_tokens:
         return 0
-    tokens1 = set(s1.split())
-    tokens2 = set(s2.split())
-    return len(tokens1 & tokens2)
+    return int(a_tokens[0] == b_tokens[0])
 
 
-def token_containment(s1: str, s2: str) -> float:
-    """Token containment: s1 tokens in s2"""
-    if not s1 or not s2:
-        return 0.0
-    tokens1 = set(s1.split())
-    tokens2 = set(s2.split())
-    if not tokens1:
-        return 0.0
-    return len(tokens1 & tokens2) / len(tokens1)
-
-
-def token_set_ratio(s1: str, s2: str) -> float:
-    """Token set ratio (RapidFuzz)"""
-    if not s1 or not s2:
-        return 0.0
-    return fuzz.token_set_ratio(s1, s2) / 100.0
-
-
-def token_sort_ratio(s1: str, s2: str) -> float:
-    """Token sort ratio (RapidFuzz)"""
-    if not s1 or not s2:
-        return 0.0
-    return fuzz.token_sort_ratio(s1, s2) / 100.0
-
-
-def char_ngram_cosine(s1: str, s2: str, n: int = 3) -> float:
-    """Character n-gram cosine similarity"""
-    if not s1 or not s2:
-        return 0.0
-    
-    def get_ngrams(text: str, n: int) -> Counter:
-        text = f" {text} "
-        return Counter(text[i:i+n] for i in range(len(text) - n + 1))
-    
-    c1 = get_ngrams(s1, n)
-    c2 = get_ngrams(s2, n)
-    
-    if not c1 and not c2:
+def digit_run_overlap(a_digits: List[str], b_digits: List[str]) -> float:
+    if not a_digits and not b_digits:
         return 1.0
-    if not c1 or not c2:
+    if not a_digits or not b_digits:
         return 0.0
-    
-    # Cosine similarity
-    dot = sum(c1[k] * c2[k] for k in c1 if k in c2)
-    norm1 = np.sqrt(sum(v*v for v in c1.values()))
-    norm2 = np.sqrt(sum(v*v for v in c2.values()))
-    
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return dot / (norm1 * norm2)
+    set_a, set_b = set(a_digits), set(b_digits)
+    return len(set_a & set_b) / len(set_a | set_b)
 
 
-def common_token_count(s1: str, s2: str) -> int:
-    """Count of common tokens"""
-    if not s1 or not s2:
+def landmark_overlap(a_landmarks: List[str], b_landmarks: List[str]) -> int:
+    if not a_landmarks and not b_landmarks:
+        return 1
+    if not a_landmarks or not b_landmarks:
         return 0
-    return len(set(s1.split()) & set(s2.split()))
+    return int(bool(set(a_landmarks) & set(b_landmarks)))
 
 
-def rare_token_overlap(s1: str, s2: str, idf_dict: Dict[str, float] = None) -> float:
-    """IDF-weighted rare token overlap"""
-    if not s1 or not s2:
+def component_overlap_jaccard(a_tokens: List[str], b_tokens: List[str]) -> float:
+    return token_set_jaccard(a_tokens, b_tokens)
+
+
+def length_ratio(a: str, b: str) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
         return 0.0
-    tokens1 = set(s1.split())
-    tokens2 = set(s2.split())
-    common = tokens1 & tokens2
-    if not common:
-        return 0.0
-    if idf_dict is None:
-        return len(common)
-    return sum(idf_dict.get(t, 1.0) for t in common)
+    return min(len(a), len(b)) / max(len(a), len(b))
 
 
-def first_token_eq(s1: str, s2: str) -> int:
-    """First token equality"""
-    if not s1 or not s2:
-        return 0
-    t1 = s1.split()[0] if s1.split() else ""
-    t2 = s2.split()[0] if s2.split() else ""
-    return int(t1 == t2)
+def compute_name_features(s1_name: Dict, s23_name: Dict) -> Dict[str, float]:
+    """Compute all name-based features."""
+    feats = {}
+
+    n1_full = s1_name["full_normalized"]
+    n2_full = s23_name["full_normalized"]
+    n1_core = s1_name["suffix_stripped"]
+    n2_core = s23_name["suffix_stripped"]
+    n1_raw = s1_name["raw"]
+    n2_raw = s23_name["raw"]
+
+    feats["name_jaro_winkler"] = jaro_winkler_sim(n1_full, n2_full)
+    feats["name_levenshtein_ratio"] = levenshtein_ratio(n1_full, n2_full)
+    feats["name_token_set_jaccard"] = token_set_jaccard(s1_name["tokens"], s23_name["tokens"])
+    feats["name_token_sort_ratio"] = token_sort_ratio(n1_full, n2_full)
+    feats["name_exact_match_raw"] = exact_match_flag(n1_raw, n2_raw)
+    feats["name_exact_match_norm"] = exact_match_flag(n1_full, n2_full)
+    feats["name_contains_substring"] = contains_substring(n1_full, n2_full)
+    feats["name_first_token_match"] = first_token_match(s1_name["tokens"], s23_name["tokens"])
+    feats["name_token_count_diff"] = abs(s1_name["token_count"] - s23_name["token_count"])
+
+    # Suffix-stripped variants
+    feats["name_core_jaro_winkler"] = jaro_winkler_sim(n1_core, n2_core)
+    feats["name_core_levenshtein_ratio"] = levenshtein_ratio(n1_core, n2_core)
+    feats["name_core_token_set_jaccard"] = token_set_jaccard(s1_name["core_tokens"], s23_name["core_tokens"])
+    feats["name_core_token_sort_ratio"] = token_sort_ratio(n1_core, n2_core)
+    feats["name_core_exact_match"] = exact_match_flag(n1_core, n2_core)
+
+    return feats
 
 
-def first_two_tokens_eq(s1: str, s2: str) -> int:
-    """First two tokens equality"""
-    if not s1 or not s2:
-        return 0
-    t1 = " ".join(s1.split()[:2])
-    t2 = " ".join(s2.split()[:2])
-    return int(t1 == t2)
+def compute_address_features(s1_addr: Dict, s23_addr: Dict) -> Dict[str, float]:
+    """Compute all address-based features."""
+    feats = {}
+
+    a1_full = s1_addr["expanded_normalized"]
+    a2_full = s23_addr["expanded_normalized"]
+    a1_raw = s1_addr["raw"]
+    a2_raw = s23_addr["raw"]
+
+    feats["addr_jaro_winkler"] = jaro_winkler_sim(a1_full, a2_full)
+    feats["addr_levenshtein_ratio"] = levenshtein_ratio(a1_full, a2_full)
+    feats["addr_token_set_jaccard"] = token_set_jaccard(s1_addr["tokens"], s23_addr["tokens"])
+    feats["addr_token_sort_ratio"] = token_sort_ratio(a1_full, a2_full)
+    feats["addr_exact_match_raw"] = exact_match_flag(a1_raw, a2_raw)
+    feats["addr_exact_match_norm"] = exact_match_flag(a1_full, a2_full)
+    feats["addr_contains_substring"] = contains_substring(a1_full, a2_full)
+    feats["addr_first_token_match"] = first_token_match(s1_addr["tokens"], s23_addr["tokens"])
+    feats["addr_token_count_diff"] = abs(s1_addr["token_count"] - s23_addr["token_count"])
+
+    # Structured components
+    feats["street_number_match"] = int(s1_addr["street_number"] == s23_addr["street_number"] and s1_addr["street_number"] != "")
+    feats["postal_code_match"] = int(bool(set(s1_addr["postal_codes"]) & set(s23_addr["postal_codes"])))
+    feats["digit_run_overlap"] = digit_run_overlap(s1_addr["postal_codes"], s23_addr["postal_codes"])
+    feats["landmark_overlap"] = landmark_overlap(s1_addr["landmark_tokens"], s23_addr["landmark_tokens"])
+    feats["addr_component_jaccard"] = component_overlap_jaccard(s1_addr["tokens"], s23_addr["tokens"])
+    feats["addr_length_ratio"] = length_ratio(a1_full, a2_full)
+
+    return feats
 
 
-def last_token_eq(s1: str, s2: str) -> int:
-    """Last token equality"""
-    if not s1 or not s2:
-        return 0
-    t1 = s1.split()[-1] if s1.split() else ""
-    t2 = s2.split()[-1] if s2.split() else ""
-    return int(t1 == t2)
+def compute_cross_features(name_feats: Dict, addr_feats: Dict,
+                           s1_country: str, s23_country: str,
+                           s23_source: str) -> Dict[str, float]:
+    """Compute cross features."""
+    feats = {}
+
+    # Interactions
+    feats["name_addr_jw_product"] = name_feats["name_jaro_winkler"] * addr_feats["addr_jaro_winkler"]
+    feats["name_addr_tsj_product"] = name_feats["name_token_set_jaccard"] * addr_feats["addr_token_set_jaccard"]
+    feats["name_core_addr_jw_product"] = name_feats["name_core_jaro_winkler"] * addr_feats["addr_jaro_winkler"]
+
+    # Country equality (string equality only)
+    feats["country_match"] = int(s1_country == s23_country and s1_country != "")
+
+    # Source indicator
+    feats["source_is_s2"] = int(s23_source == "S2")
+    feats["source_is_s3"] = int(s23_source == "S3")
+
+    return feats
 
 
-def length_diff(s1: str, s2: str) -> int:
-    """Length difference"""
-    return abs(len(s1) - len(s2))
+def compute_all_features(s1_rec: NormalizedRecord,
+                         s23_rec: NormalizedRecord,
+                         tfidf_vectorizer: TfidfVectorizer = None) -> Dict[str, float]:
+    """Compute all features for a candidate pair."""
+    feats = {}
 
+    name_feats = compute_name_features(s1_rec.name, s23_rec.name)
+    addr_feats = compute_address_features(s1_rec.address, s23_rec.address)
+    cross_feats = compute_cross_features(name_feats, addr_feats,
+                                          s1_rec.country, s23_rec.country,
+                                          "S2" if s23_rec.entity_id.startswith("S2") else "S3")
 
-def length_ratio(s1: str, s2: str) -> float:
-    """Length ratio (min/max)"""
-    if not s1 or not s2:
-        return 0.0
-    l1, l2 = len(s1), len(s2)
-    return min(l1, l2) / max(l1, l2) if max(l1, l2) > 0 else 0.0
+    feats.update(name_feats)
+    feats.update(addr_feats)
+    feats.update(cross_feats)
 
-
-def token_count_diff(s1: str, s2: str) -> int:
-    """Token count difference"""
-    return abs(len(s1.split()) - len(s2.split()))
-
-
-def legal_form_agreement(s1: str, s2: str) -> int:
-    """Check if legal forms agree"""
-    legal_forms = {"inc", "corp", "llc", "ltd", "pvt", "plc", "co", "company",
-                   "incorporated", "corporation", "limited", "private"}
-    t1 = set(s1.split()) & legal_forms
-    t2 = set(s2.split()) & legal_forms
-    if not t1 and not t2:
-        return 1  # Both have no legal form
-    if not t1 or not t2:
-        return 0  # Only one has legal form
-    return int(t1 == t2)
-
-
-def exact_eq(s1: str, s2: str) -> int:
-    """Exact string equality"""
-    return int(s1 == s2)
-
-
-def partial_eq(s1: str, s2: str) -> int:
-    """Partial string containment"""
-    if not s1 or not s2:
-        return 0
-    return int(s1 in s2 or s2 in s1)
-
-
-def numeric_token_overlap(s1: str, s2: str) -> int:
-    """Overlap of numeric tokens"""
-    if not s1 or not s2:
-        return 0
-    nums1 = {t for t in s1.split() if t.isdigit()}
-    nums2 = {t for t in s2.split() if t.isdigit()}
-    return len(nums1 & nums2)
-
-
-def soft_token_match(s1: str, s2: str, idf_dict: Dict[str, float] = None) -> float:
-    """Dictionary-free soft token matching with edit distance"""
-    if not s1 or not s2:
-        return 0.0
-    tokens1 = s1.split()
-    tokens2 = s2.split()
-    
-    if idf_dict is None:
-        idf_dict = {}
-    
-    total_weight = 0.0
-    matched_weight = 0.0
-    
-    for t1 in tokens1:
-        w1 = idf_dict.get(t1, 1.0)
-        total_weight += w1
-        best_match = 0.0
-        for t2 in tokens2:
-            # Exact match
-            if t1 == t2:
-                best_match = 1.0
-                break
-            # Near edit match (Levenshtein)
-            ratio = fuzz.ratio(t1, t2) / 100.0
-            if ratio >= 0.8:
-                best_match = max(best_match, ratio * 0.8)
-            # Abbreviation compatible (one is prefix of other, min len 3)
-            if len(t1) >= 3 and len(t2) >= 3:
-                if t1.startswith(t2) or t2.startswith(t1):
-                    best_match = max(best_match, 0.6)
-        matched_weight += w1 * best_match
-    
-    if total_weight == 0:
-        return 0.0
-    return matched_weight / total_weight
-
-
-def compute_idf(tokens_list: List[str]) -> Dict[str, float]:
-    """Compute IDF weights from token corpus"""
-    doc_count = len(tokens_list)
-    token_docs = Counter()
-    
-    for tokens in tokens_list:
-        unique_tokens = set(tokens.split())
-        for t in unique_tokens:
-            token_docs[t] += 1
-    
-    idf = {}
-    for token, df in token_docs.items():
-        idf[token] = np.log(doc_count / df + 1)
-    
-    return idf
-
-
-def create_pair_features(
-    s1_row: Dict,
-    cand_row: Dict,
-    idf_dict: Dict[str, float] = None,
-) -> Dict[str, float]:
-    """Create feature vector for a pair"""
-    features = {}
-    
-    # Name features
-    s1_name = s1_row.get("name_normalized", "")
-    c_name = cand_row.get("name_normalized", "")
-    s1_core = s1_row.get("name_core", "")
-    c_core = cand_row.get("name_core", "")
-    s1_tokens = s1_row.get("name_tokens", "")
-    c_tokens = cand_row.get("name_tokens", "")
-    s1_sorted = s1_row.get("name_sorted_tokens", "")
-    c_sorted = cand_row.get("name_sorted_tokens", ")
-    s1_token_set = s1_row.get("name_token_set", "")
-    c_token_set = cand_row.get("name_token_set", "")
-    s1_compact = s1_row.get("name_compact", "")
-    c_compact = cand_row.get("name_compact", "")
-    
-    features["name_exact_eq"] = exact_eq(s1_name, c_name)
-    features["name_core_eq"] = exact_eq(s1_core, c_core)
-    features["name_jaro_winkler"] = jaro_winkler(s1_name, c_name)
-    features["name_levenshtein_ratio"] = levenshtein_ratio(s1_name, c_name)
-    features["name_token_jaccard"] = token_jaccard(s1_tokens, c_tokens)
-    features["name_token_overlap"] = token_overlap(s1_tokens, c_tokens)
-    features["name_token_containment"] = token_containment(s1_tokens, c_tokens)
-    features["name_token_set_ratio"] = token_set_ratio(s1_tokens, c_tokens)
-    features["name_token_sort_ratio"] = token_sort_ratio(s1_tokens, c_tokens)
-    features["name_char_3gram_cosine"] = char_ngram_cosine(s1_name, c_name, 3)
-    features["name_char_4gram_cosine"] = char_ngram_cosine(s1_name, c_name, 4)
-    features["name_char_5gram_cosine"] = char_ngram_cosine(s1_name, c_name, 5)
-    features["name_common_token_count"] = common_token_count(s1_tokens, c_tokens)
-    features["name_rare_token_overlap"] = rare_token_overlap(s1_tokens, c_tokens, idf_dict)
-    features["name_first_token_eq"] = first_token_eq(s1_tokens, c_tokens)
-    features["name_first_two_token_eq"] = first_two_tokens_eq(s1_tokens, c_tokens)
-    features["name_last_token_eq"] = last_token_eq(s1_tokens, c_tokens)
-    features["name_length_diff"] = length_diff(s1_name, c_name)
-    features["name_length_ratio"] = length_ratio(s1_name, c_name)
-    features["name_token_count_diff"] = token_count_diff(s1_tokens, c_tokens)
-    features["name_legal_form_agree"] = legal_form_agreement(s1_tokens, c_tokens)
-    features["name_soft_token_match"] = soft_token_match(s1_tokens, c_tokens, idf_dict)
-    
-    # Address features
-    s1_addr = s1_row.get("address_normalized", "")
-    c_addr = cand_row.get("address_normalized", "")
-    s1_addr_tokens = s1_row.get("address_tokens", "")
-    c_addr_tokens = cand_row.get("address_tokens", "")
-    s1_addr_compact = s1_row.get("address_compact", "")
-    c_addr_compact = cand_row.get("address_compact", "")
-    s1_postal = s1_row.get("address_postal_code", "")
-    c_postal = cand_row.get("address_postal_code", "")
-    s1_house = s1_row.get("address_house_number", "")
-    c_house = cand_row.get("address_house_number", "")
-    s1_street = s1_row.get("address_street_tokens", "")
-    c_street = cand_row.get("address_street_tokens", "")
-    s1_city = s1_row.get("city_normalized", "")
-    c_city = cand_row.get("city_normalized", "")
-    s1_state = s1_row.get("state_normalized", "")
-    c_state = cand_row.get("state_normalized", "")
-    
-    features["address_exact_eq"] = exact_eq(s1_addr, c_addr)
-    features["address_char_3gram_cosine"] = char_ngram_cosine(s1_addr, c_addr, 3)
-    features["address_char_4gram_cosine"] = char_ngram_cosine(s1_addr, c_addr, 4)
-    features["address_char_5gram_cosine"] = char_ngram_cosine(s1_addr, c_addr, 5)
-    features["address_token_jaccard"] = token_jaccard(s1_addr_tokens, c_addr_tokens)
-    features["address_token_overlap"] = token_overlap(s1_addr_tokens, c_addr_tokens)
-    features["address_token_containment"] = token_containment(s1_addr_tokens, c_addr_tokens)
-    features["address_levenshtein_ratio"] = levenshtein_ratio(s1_addr, c_addr)
-    features["address_postal_eq"] = exact_eq(s1_postal, c_postal)
-    features["address_postal_partial"] = partial_eq(s1_postal, c_postal)
-    features["address_house_eq"] = exact_eq(s1_house, c_house)
-    features["address_street_overlap"] = token_overlap(s1_street, c_street)
-    features["address_city_eq"] = exact_eq(s1_city, c_city)
-    features["address_state_eq"] = exact_eq(s1_state, c_state)
-    features["address_length_ratio"] = length_ratio(s1_addr, c_addr)
-    features["address_token_count_diff"] = token_count_diff(s1_addr_tokens, c_addr_tokens)
-    features["address_numeric_overlap"] = numeric_token_overlap(s1_addr_tokens, c_addr_tokens)
-    
-    # Cross-field features
-    features["name_addr_sim_product"] = features["name_jaro_winkler"] * features["address_char_3gram_cosine"]
-    features["high_name_high_addr"] = int(features["name_jaro_winkler"] > 0.8 and features["address_char_3gram_cosine"] > 0.7)
-    features["high_name_low_addr"] = int(features["name_jaro_winkler"] > 0.8 and features["address_char_3gram_cosine"] <= 0.3)
-    features["low_name_high_addr"] = int(features["name_jaro_winkler"] <= 0.3 and features["address_char_3gram_cosine"] > 0.7)
-    features["exact_name_exact_postal"] = int(features["name_exact_eq"] and features["address_postal_eq"])
-    features["exact_postal_house_eq"] = int(features["address_postal_eq"] and features["address_house_eq"])
-    
-    # Country features
-    s1_country = s1_row.get("country_normalized", "")
-    c_country = cand_row.get("country_normalized", "")
-    features["same_country"] = int(s1_country == c_country and s1_country != "")
-    features["country_missing"] = int(s1_country == "" or c_country == "")
-    features["country_conflict"] = int(s1_country != "" and c_country != "" and s1_country != c_country)
-    
-    # Name similarity conditioned on country
-    if features["same_country"]:
-        features["name_sim_same_country"] = features["name_jaro_winkler"]
-        features["addr_sim_same_country"] = features["address_char_3gram_cosine"]
+    # TF-IDF cosine on combined text (if vectorizer provided)
+    if tfidf_vectorizer is not None:
+        texts = [s1_rec.full_normalized, s23_rec.full_normalized]
+        tfidf = tfidf_vectorizer.transform(texts)
+        cos_sim = (tfidf[0] * tfidf[1].T).toarray()[0, 0]
+        feats["tfidf_cosine"] = float(cos_sim)
     else:
-        features["name_sim_same_country"] = 0.0
-        features["addr_sim_same_country"] = 0.0
-    
-    return features
+        feats["tfidf_cosine"] = 0.0
+
+    return feats
 
 
-def compute_blocking_features(
-    s1_id: str,
-    cand_id: str,
-    candidate_pairs_df: pl.DataFrame,
-) -> Dict[str, float]:
-    """Compute blocking-related features for a pair"""
-    features = {}
-    
-    # Get all candidates for this S1
-    s1_candidates = candidate_pairs_df.filter(pl.col("source1_entity_id") == s1_id)
-    candidate_count = len(s1_candidates)
-    features["candidate_count"] = candidate_count
-    
-    # Get channels for this pair
-    pair_row = s1_candidates.filter(pl.col("candidate_entity_id") == cand_id)
-    if len(pair_row) > 0:
-        channels_str = pair_row["channels"][0] if "channels" in pair_row.columns else ""
-        channels = set(channels_str.split(",")) if channels_str else set()
-        features["n_blocking_channels"] = len(channels)
-        
-        # Exact key indicators
-        for ch in ["exact_name", "core_name", "exact_postal", "exact_house"]:
-            features[f"channel_{ch}"] = int(ch in channels)
-    else:
-        features["n_blocking_channels"] = 0
-        for ch in ["exact_name", "core_name", "exact_postal", "exact_house"]:
-            features[f"channel_{ch}"] = 0
-    
-    # Candidates sharing same normalized name
-    same_name = s1_candidates.filter(pl.col("candidate_entity_id") == cand_id)
-    if len(same_name) > 0 and "name_normalized" in s1_candidates.columns:
-        pass  # Would need join with candidate details
-    
-    return features
+def build_feature_matrix(candidates: Dict[str, List],
+                         s1_records: List[NormalizedRecord],
+                         s23_records: List[NormalizedRecord]) -> Tuple[np.ndarray, List[str], List[Tuple[str, str]]]:
+    """Build feature matrix for all candidate pairs."""
+    s1_dict = {r.entity_id: r for r in s1_records}
+    s23_dict = {r.entity_id: r for r in s23_records}
 
+    # Collect all texts for TF-IDF
+    all_texts = []
+    pair_list = []
+    for s1_id, cand_list in candidates.items():
+        for cand in cand_list:
+            s1_rec = s1_dict[s1_id]
+            s23_rec = s23_dict[cand.s23_id]
+            pair_list.append((s1_id, cand.s23_id))
+            all_texts.append(s1_rec.full_normalized)
+            all_texts.append(s23_rec.full_normalized)
 
-def create_difficulty_features(
-    s1_row: Dict,
-    all_candidates_df: pl.DataFrame,
-    s1_id: str,
-) -> Dict[str, float]:
-    """Create difficulty features for an S1 entity"""
-    features = {}
-    
-    s1_candidates = all_candidates_df.filter(pl.col("source1_entity_id") == s1_id)
-    features["candidate_count"] = len(s1_candidates)
-    
-    # These would require joining with candidate details
-    # Placeholder for now
-    features["same_name_candidates"] = 0
-    features["same_postal_candidates"] = 0
-    features["same_address_token_candidates"] = 0
-    
-    return features
+    # Fit TF-IDF on all texts
+    tfidf_vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=1)
+    tfidf_vectorizer.fit(all_texts)
 
+    # Compute features
+    feature_rows = []
+    for s1_id, s23_id in pair_list:
+        s1_rec = s1_dict[s1_id]
+        s23_rec = s23_dict[s23_id]
+        feats = compute_all_features(s1_rec, s23_rec, tfidf_vectorizer)
+        feature_rows.append(feats)
 
-def build_feature_matrix(
-    pairs_df: pl.DataFrame,
-    s1_df: pl.DataFrame,
-    s23_df: pl.DataFrame,
-    idf_dict: Dict[str, float] = None,
-) -> Tuple[np.ndarray, List[str]]:
-    """Build feature matrix for all pairs"""
-    # Create lookup dictionaries
-    s1_lookup = {row["entity_id"]: row for row in s1_df.iter_rows(named=True)}
-    s23_lookup = {row["entity_id"]: row for row in s23_df.iter_rows(named=True)}
-    
-    feature_list = []
-    feature_names = None
-    
-    for pair in pairs_df.iter_rows(named=True):
-        s1_id = pair["source1_entity_id"]
-        cand_id = pair["candidate_entity_id"]
-        
-        s1_row = s1_lookup.get(s1_id, {})
-        cand_row = s23_lookup.get(cand_id, {})
-        
-        features = create_pair_features(s1_row, cand_row, idf_dict)
-        
-        if feature_names is None:
-            feature_names = sorted(features.keys())
-        
-        feature_list.append([features.get(name, 0.0) for name in feature_names])
-    
-    return np.array(feature_list, dtype=np.float32), feature_names
+    # Convert to matrix
+    feature_names = sorted(feature_rows[0].keys()) if feature_rows else []
+    X = np.array([[row.get(fn, 0.0) for fn in feature_names] for row in feature_rows], dtype=np.float32)
 
-
-def compute_tfidf_similarity(
-    texts1: List[str],
-    texts2: List[str],
-    analyzer: str = "char_wb",
-    ngram_range: Tuple[int, int] = (3, 5),
-) -> np.ndarray:
-    """Compute TF-IDF cosine similarity between two lists of texts"""
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    
-    vectorizer = TfidfVectorizer(
-        analyzer=analyzer,
-        ngram_range=ngram_range,
-        max_features=50000,
-    )
-    
-    all_texts = texts1 + texts2
-    tfidf_matrix = vectorizer.fit_transform(all_texts)
-    
-    n1 = len(texts1)
-    sim_matrix = cosine_similarity(tfidf_matrix[:n1], tfidf_matrix[n1:])
-    
-    return np.diag(sim_matrix)
+    return X, feature_names, pair_list
